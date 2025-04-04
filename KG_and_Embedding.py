@@ -146,7 +146,6 @@ def load_stage_2_results(stage_2_file):
     
     
 def generate_relation_embeddings(relations, model):
-    """批量生成关系嵌入"""
     if not relations:
         return np.array([])
     with autocast():
