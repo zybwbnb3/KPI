@@ -1,4 +1,4 @@
-import json
+import json  # 添加缺失的json导入
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,7 +7,7 @@ import pandas as pd
 from tqdm import tqdm
 import sys
 import os
-from colorama import Fore
+from colorama import Fore, Style
 from torch.optim import lr_scheduler
 from torch.cuda.amp import GradScaler, autocast
 from transformers import AutoTokenizer, AutoModel
@@ -19,13 +19,18 @@ from torch_geometric.data import Data
 from torch_geometric.utils import k_hop_subgraph
 from torch_geometric.nn import GATConv
 from sklearn.metrics.pairwise import cosine_similarity
-from colorama import Fore, Style
 import random
 from transformers import set_seed
 import argparse
 import csv
-import os
+import math
 
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="torch")
+
+# 修改过模型架构，但是效果下降了 73.x
 
 def others_set_seed(seed: int):
     random.seed(seed)
@@ -38,17 +43,17 @@ def others_set_seed(seed: int):
 def one_hot(a, num_classes):
     return np.squeeze(np.eye(num_classes)[a.reshape(-1)])
 
-
+# 设备选择
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 warnings.filterwarnings("ignore")
-others_set_seed(1234)
-set_seed(1234)
+others_set_seed(2026)
+set_seed(2026)
+
 
 def load_fused_kg(kg_file):
     with open(kg_file, 'r', encoding='utf-8') as f:
         kg_data = json.load(f)
-    return kg_data
-
+    return kg_data  # 融合后的 KG 三元组列表
 
 
 def load_patient_data(csv_file):
@@ -57,42 +62,48 @@ def load_patient_data(csv_file):
 
 
 def build_graph_from_kg(kg_triplets):
-
-    node_dict = {}
-    edges = []
-    edge_attrs = []
+    """
+    kg_triplets: 融合后的知识图谱三元组列表，每个元素为字典，包含：
+       "subject", "relation", "object",
+       "subject_embedding" (list), "relation_embedding" (list), "object_embedding" (list)
+    返回：PyG Data 对象、节点映射字典
+    """
+    node_dict = {}  # 存储节点及其预构建嵌入（取首次出现时的嵌入）
+    edges = []      # 边列表（存储 (subject, object) 对）
+    edge_attrs = [] # 边属性列表，存储每条边对应的关系嵌入
 
     for trip in kg_triplets:
         subj = trip["subject"]
         obj = trip["object"]
-        rel = trip["relation"]
-        rel_emb = trip["relation_embedding"]
+        rel_emb = trip["relation_embedding"]  # 预构建的关系嵌入（list）
+
         if subj not in node_dict:
             node_dict[subj] = np.array(trip["subject_embedding"])
         if obj not in node_dict:
             node_dict[obj] = np.array(trip["object_embedding"])
+
         edges.append((subj, obj))
         edge_attrs.append(np.array(rel_emb))
 
     node_list = list(node_dict.keys())
     node_to_idx = {node: idx for idx, node in enumerate(node_list)}
 
-    features = []
-    for node in node_list:
-        features.append(node_dict[node])
+    # 构建节点特征矩阵：直接使用预计算的嵌入
+    features = [node_dict[node] for node in node_list]
     x = torch.tensor(np.stack(features), dtype=torch.float)
 
+    # 构建边索引
     edge_index = [[], []]
     for subj, obj in edges:
         edge_index[0].append(node_to_idx[subj])
         edge_index[1].append(node_to_idx[obj])
     edge_index = torch.tensor(edge_index, dtype=torch.long)
 
+    # 构建边属性张量（关系嵌入）
     edge_attr = torch.tensor(np.stack(edge_attrs), dtype=torch.float)
 
     data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
     return data, node_to_idx
-
 
 
 class CrossAttentionMatcher(nn.Module):
@@ -108,33 +119,45 @@ class CrossAttentionMatcher(nn.Module):
         self.value_proj = nn.Linear(embed_dim, embed_dim)
         self.out_proj = nn.Linear(embed_dim, embed_dim)
         self.softmax = nn.Softmax(dim=-1)
-        self.alpha = 0.5
+        self.alpha = 0.5  # 权重参数
 
     def forward(self, disease_embed, keyword_embeds, entity_embeds):
-
+        """
+        disease_embed: (1, D) 疾病全局嵌入
+        keyword_embeds: (num_keywords, D) 患者关键词嵌入（不求平均）
+        entity_embeds: (num_entities, D) 子图中所有节点的嵌入
+        """
+        # 融合疾病嵌入与患者关键词，采用加权平均方式
         combined_query = self.alpha * disease_embed + (1 - self.alpha) * keyword_embeds.mean(dim=0, keepdim=True)  # (1, D)
         Q = self.query_proj(combined_query)  # (1, D)
-        K = self.key_proj(entity_embeds)       # (num_entities, D)
-        V = self.value_proj(entity_embeds)       # (num_entities, D)
+        K = self.key_proj(entity_embeds)     # (num_entities, D)
+        V = self.value_proj(entity_embeds)   # (num_entities, D)
 
-        Q = Q.view(1, self.num_heads, self.head_dim).transpose(0, 1)  # (num_heads, 1, head_dim)
-        K = K.view(-1, self.num_heads, self.head_dim).transpose(0, 1)   # (num_heads, num_entities, head_dim)
-        V = V.view(-1, self.num_heads, self.head_dim).transpose(0, 1)   # (num_heads, num_entities, head_dim)
+        # 重塑为多头形式
+        Q = Q.view(1, self.num_heads, self.head_dim).transpose(0, 1)           # (num_heads, 1, head_dim)
+        K = K.view(-1, self.num_heads, self.head_dim).transpose(0, 1)          # (num_heads, num_entities, head_dim)
+        V = V.view(-1, self.num_heads, self.head_dim).transpose(0, 1)          # (num_heads, num_entities, head_dim)
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) * (self.head_dim ** -0.5)  # (num_heads, 1, num_entities)
-        attn_weights = self.softmax(scores)  # (num_heads, 1, num_entities)
+        attn_weights = self.softmax(scores)                                      # (num_heads, 1, num_entities)
+        # 平均各头的注意力权重
         avg_attn_weights = attn_weights.mean(dim=0).squeeze(0)  # (num_entities,)
 
+        # 使用 V：将多头的 V 平均，得到每个实体的表示
         avg_V = V.mean(dim=0)  # (num_entities, head_dim)
+        # 计算每个实体表示的 L2 范数
         v_norm = torch.norm(avg_V, dim=1)  # (num_entities,)
+        # 最终的匹配分数：结合注意力权重和实体表示的范数
         matching_scores = avg_attn_weights * v_norm  # (num_entities,)
         return matching_scores
 
 
+# 数据集定义
 class PatientDataset(Dataset):
     def __init__(self, dataframe, disease_dict):
         self.dataframe = dataframe
         self.disease_dict = disease_dict
+
     def __getitem__(self, index):
         row = self.dataframe.iloc[index]
         gender = row['gender']
@@ -155,14 +178,16 @@ class PatientDataset(Dataset):
             'category': category,
             'keywords': keywords
         }
+
     def __len__(self):
         return len(self.dataframe)
+
 
 def collate_fn(batch):
     return {
         'gender': torch.tensor([item['gender'] for item in batch], dtype=torch.long),
         'pregnancy': torch.tensor([item['pregnancy'] for item in batch], dtype=torch.long),
-        'profile': torch.tensor([item['profile'] for item in batch]),
+        'profile': torch.tensor([item['profile'] for item in batch], dtype=torch.float),
         'description': [item['description'] for item in batch],
         'disease': [item['disease'] for item in batch],
         'category': [item['category'] for item in batch],
@@ -178,14 +203,18 @@ class SentenceTransformer(nn.Module):
         self.device = device
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, mirror='tuna')
         self.model = AutoModel.from_pretrained(model_name, mirror='tuna').to(self.device)
+        # 添加一个可学习的门控参数，用于融合两种池化方式
         self.gate = nn.Linear(self.model.config.hidden_size, 1)
 
     def forward(self, sentences):
         encoded_input = self.tokenize(sentences).to(self.device)
         model_output = self.model(**encoded_input)
+        # 使用注意力门控对 mean pooling 和 max pooling 进行加权融合
         mean_pooled = self.mean_pooling(model_output, encoded_input['attention_mask'])
         max_pooled = torch.max(model_output.last_hidden_state, dim=1)[0]
+        # 计算门控系数（sigmoid 后作为权重）
         gate_weight = torch.sigmoid(self.gate(mean_pooled))
+        # 融合两种池化结果
         pooled_output = gate_weight * mean_pooled + (1 - gate_weight) * max_pooled
         pooled_output = F.normalize(pooled_output, p=2, dim=1)
         return pooled_output
@@ -201,7 +230,6 @@ class SentenceTransformer(nn.Module):
         return tokens
 
 
-
 class PatientEmbedding(nn.Module):
     def __init__(self, in_dim=3, attention_dim=128, gender_dim=8, pregnancy_dim=8, num_heads=4, dropout=0.1,
                  out_dim=32, margin=1.0, alpha=0.3, tokenizer_name='sentence-transformers/all-MiniLM-L6-v2',
@@ -211,20 +239,24 @@ class PatientEmbedding(nn.Module):
         self.sentence_transformer = SentenceTransformer(tokenizer_name, model_name, device)
         self.sentence_dim = self.sentence_transformer.model.config.hidden_size
         self.alpha = alpha
+        # Embedding layers for categorical variables
         self.gender_emb = nn.Embedding(2, gender_dim).to(self.device)
         self.pregnancy_emb = nn.Embedding(2, pregnancy_dim).to(self.device)
 
-        self.input_projection = nn.Linear(gender_dim + pregnancy_dim + in_dim, attention_dim, dtype=torch.float64)
+        # Linear projection layer (float32 默认即可，方便 AMP)
+        self.input_projection = nn.Linear(gender_dim + pregnancy_dim + in_dim, attention_dim)
 
-        self.attention1 = nn.MultiheadAttention(embed_dim=attention_dim, num_heads=num_heads, dropout=dropout,
-                                                batch_first=True, dtype=torch.float64)
-        self.layer_norm1 = nn.LayerNorm(attention_dim, dtype=torch.float64)
+        # Multihead attention for feature refinement
+        self.attention1 = nn.MultiheadAttention(embed_dim=attention_dim, num_heads=num_heads,
+                                                dropout=dropout, batch_first=True)
+        self.layer_norm1 = nn.LayerNorm(attention_dim)
 
-        self.attention2 = nn.MultiheadAttention(embed_dim=attention_dim + self.sentence_dim, num_heads=num_heads,
-                                                dropout=dropout, batch_first=True, dtype=torch.float64)
-        self.layer_norm2 = nn.LayerNorm(attention_dim + self.sentence_dim, dtype=torch.float64)
+        self.attention2 = nn.MultiheadAttention(embed_dim=attention_dim + self.sentence_dim,
+                                                num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.layer_norm2 = nn.LayerNorm(attention_dim + self.sentence_dim)
 
-        self.proj = nn.Linear(attention_dim + self.sentence_dim, out_dim, dtype=torch.float64)
+        # Output projection
+        self.proj = nn.Linear(attention_dim + self.sentence_dim, out_dim)
 
         self.margin = margin
         self.temperature = 0.07
@@ -237,53 +269,75 @@ class PatientEmbedding(nn.Module):
         pregnancy = pregnancy.to(self.device)
         profile = profile.to(self.device)
 
+        # Normalize input profile to stabilize training
         profile = F.normalize(profile, dim=1, p=2)
 
+        # Concatenate structured features
         input_features = torch.cat([self.gender_emb(gender), self.pregnancy_emb(pregnancy), profile], dim=1)
-        input_features = self.input_projection(input_features)
+        input_features = self.input_projection(input_features)  # [B, D]
 
-        attn_output, _ = self.attention1(input_features.unsqueeze(1), input_features.unsqueeze(1), input_features.unsqueeze(1))
+        # Apply multihead attention (seq_len=1，自注意力更像 MLP，但保持结构不改)
+        attn_output, _ = self.attention1(
+            input_features.unsqueeze(1),
+            input_features.unsqueeze(1),
+            input_features.unsqueeze(1)
+        )
         attn_output = self.layer_norm1(attn_output.squeeze(1))
 
-        sentence_embeddings = self.sentence_transformer(description)
+        # Compute textual embeddings
+        sentence_embeddings = self.sentence_transformer(description)  # [B, D_text]
 
-        combined_features = torch.cat([attn_output, sentence_embeddings], dim=1)
-        combined_features, _ = self.attention2(combined_features.unsqueeze(1), combined_features.unsqueeze(1), combined_features.unsqueeze(1))
+        # Apply second attention layer for fusion
+        combined_features = torch.cat([attn_output, sentence_embeddings], dim=1)  # [B, D+D_text]
+        combined_features, _ = self.attention2(
+            combined_features.unsqueeze(1),
+            combined_features.unsqueeze(1),
+            combined_features.unsqueeze(1)
+        )
         combined_features = self.layer_norm2(combined_features.squeeze(1))
 
-        patient_embedding = self.proj(combined_features)
+        # Final projection
+        patient_embedding = self.proj(combined_features)  # [B, out_dim]
         return patient_embedding
-
-
 
     def contrastive_loss(self, patient_emb, mod_emb, positive_emb, negative_embs, temperature=0.1):
         """
-        patient_emb: (embed_dim,)
-        positive_emb: (embed_dim,)
-        negative_embs: (num_negatives, embed_dim)
+        patient_emb: (embed_dim,) 患者表征
+        mod_emb:     (embed_dim,) 知识图子图增强后的疾病表示
+        positive_emb:(embed_dim,) 全局疾病嵌入
+        negative_embs: (num_negatives, embed_dim) 其他疾病嵌入
+
+        返回:
+          loss: 标量
+          logits: (1, 1 + num_negatives)，第 0 维是正样本
         """
+        # 语义一致性损失（MSE）
         consistency_loss = F.mse_loss(mod_emb, positive_emb)
 
-        positives = F.cosine_similarity(patient_emb.unsqueeze(0), positive_emb.unsqueeze(0)) / temperature
-        negatives = F.cosine_similarity(patient_emb.unsqueeze(0), negative_embs) / temperature
+        # InfoNCE 对比损失 (使用 cosine 相似度作为打分)
+        pos_score = F.cosine_similarity(
+            patient_emb.unsqueeze(0), positive_emb.unsqueeze(0)
+        ) / temperature                     # shape: (1,)
 
-        logits = F.softmax(torch.cat([positives, negatives], dim=0))
-        labels = torch.zeros(logits.size(0), dtype=torch.float).to(device)
-        labels[0] = 1
-        contrastive_loss = F.cross_entropy(logits.unsqueeze(0)[0], labels)
+        neg_scores = F.cosine_similarity(
+            patient_emb.unsqueeze(0), negative_embs
+        ) / temperature                     # shape: (num_negatives,)
 
-        return self.alpha * consistency_loss +  contrastive_loss, logits.unsqueeze(0)
+        logits = torch.cat([pos_score, neg_scores], dim=0).unsqueeze(0)  # (1, 1+num_neg)
+        target = torch.zeros(1, dtype=torch.long, device=logits.device)  # 正样本 index = 0
+
+        contrastive_loss = F.cross_entropy(logits, target)
+
+        return self.alpha * consistency_loss + contrastive_loss, logits
 
 
 def hit_at_k(preds, labels, k_values=[1, 3, 10]):
     hits_at_k = {}
-    max_k = preds.size(1)
+    max_k = preds.size(1)  # 获取预测中类别的最大数量（preds 的第二维度）
 
     for k in k_values:
         km = min(k, max_k)
-
         top_k = torch.topk(preds, km, dim=1).indices
-
         hits_at_k[k] = torch.sum(top_k == labels.view(-1, 1)).item() / labels.size(0)
 
     return hits_at_k
@@ -291,35 +345,49 @@ def hit_at_k(preds, labels, k_values=[1, 3, 10]):
 
 def extract_subgraph(data, node_to_idx, disease_label, disease_embed, patient_keyword_embeddings, hop=2,
                      attn_threshold=0.4, matcher=None):
-
+    """
+    从全图中提取以 disease_label 为中心的 hop 子图，
+    使用 CrossAttentionMatcher 计算节点匹配分数，并加权节点特征。
+    """
     if disease_label not in node_to_idx:
         print(f"Disease label '{disease_label}' not found in KG.")
         return None, None, None
+
     center_idx = node_to_idx[disease_label]
-    subset, edge_index, mapping, edge_mask = k_hop_subgraph(center_idx, hop, data.edge_index, relabel_nodes=True)
+    subset, edge_index, mapping, edge_mask = k_hop_subgraph(
+        center_idx, hop, data.edge_index, relabel_nodes=True
+    )
     subgraph_features = data.x[subset].to(device)  # (num_subgraph_nodes, D)
 
+    # 提取对应的边属性（关系嵌入）
     if hasattr(data, 'edge_attr'):
         subgraph_edge_attr = data.edge_attr[edge_mask]
     else:
         subgraph_edge_attr = None
 
-    attn_scores = matcher(disease_embed.to(device), patient_keyword_embeddings.to(device),
-                          subgraph_features.to(device))  # (num_subgraph_nodes,)
+    attn_scores = matcher(
+        disease_embed.to(device),
+        patient_keyword_embeddings.to(device),
+        subgraph_features.to(device)
+    )  # (num_subgraph_nodes,)
 
+    # 强制中心节点（mapping[0]）的分数设为 1，保证其必然存在
     attn_scores[mapping[0]] = 1.0
 
+    # 将每个节点的特征按对应的 attn_score 进行加权处理
     new_features = subgraph_features * attn_scores.unsqueeze(-1)
 
+    # 构造子图数据
     orig_subgraph_data = Data(x=subgraph_features, edge_index=edge_index, edge_attr=subgraph_edge_attr)
     mod_subgraph_data = Data(x=new_features, edge_index=edge_index, edge_attr=subgraph_edge_attr)
 
     return mod_subgraph_data, orig_subgraph_data, attn_scores
 
 
+# 训练函数
 def train(model, train_loader, optimizer, scaler, gnn_model, graph_data, node_to_idx, sentence_transformer_model,
           matcher, disease_idxs):
-    gnn_model.train()
+    gnn_model.train()  # GNN需要参与训练
     model.train()
     matcher.train()
     sentence_transformer_model.train()
@@ -328,17 +396,20 @@ def train(model, train_loader, optimizer, scaler, gnn_model, graph_data, node_to
     for batch in tqdm(train_loader, desc="Training", ncols=100, leave=True, dynamic_ncols=True):
         with autocast():
             optimizer.zero_grad()
+
             gender = batch['gender']
             pregnancy = batch['pregnancy']
             profile = batch['profile']
             descriptions = batch['description']
             disease_label = batch['disease']
             keywords = batch['keywords']
+
             patient_embeddings = model(gender, pregnancy, profile, descriptions)
 
+            # 对每个关键词编码（保持独立，不取平均）
             num_keywords = [len(kw_list) for kw_list in keywords]
             flattened_keywords = [kw for kw_list in keywords for kw in kw_list]
-            all_keyword_embeds = sentence_transformer_model(flattened_keywords).to(device)  # shape: [total_keywords, D]
+            all_keyword_embeds = sentence_transformer_model(flattened_keywords).to(device)
 
             keyword_embeds_list = []
             start = 0
@@ -346,37 +417,38 @@ def train(model, train_loader, optimizer, scaler, gnn_model, graph_data, node_to
                 keyword_embeds_list.append(all_keyword_embeds[start:start + n])
                 start += n
 
-
+            # 针对每个样本构造子图增强的疾病表示
             mod_disease_embedding = []
             for i in range(len(disease_label)):
                 dl = disease_label[i]
-
                 global_idx = node_to_idx[dl]
-
                 disease_embed = graph_data.x[global_idx].unsqueeze(0).to(device)
-                mod_subgraph_data, subgraph_data, attn_scores = extract_subgraph(graph_data, node_to_idx, dl,
-                                                                                 disease_embed,
-                                                                                 keyword_embeds_list[i], hop=2, matcher=matcher)
+                mod_subgraph_data, subgraph_data, attn_scores = extract_subgraph(
+                    graph_data, node_to_idx, dl, disease_embed,
+                    keyword_embeds_list[i], hop=2, matcher=matcher
+                )
                 mod_output = gnn_model(mod_subgraph_data)
                 mod_disease_embedding.append(mod_output[0])
 
+            # 更新整图的疾病表示
             updated_embeddings = gnn_model(graph_data)
             current_disease_idxs = []
             for dl in disease_label:
                 current_disease = dl.strip().lower()
                 current_disease_idxs.append(node_to_idx[current_disease])
 
-
             positive_emb = updated_embeddings[current_disease_idxs]
 
-            disease_idxs = torch.tensor(disease_idxs)
-            mask = torch.ones_like(disease_idxs, dtype=torch.bool)
-            batch_loss = 0
+            disease_idxs_tensor = torch.tensor(disease_idxs, device=device)
+            batch_loss = 0.0
 
             for i in range(len(current_disease_idxs)):
-                mask[disease_idxs == current_disease_idxs[i]] = False
-                negative_idxs = disease_idxs[mask]
+                # 每个样本单独重置 mask（修复 BUG）
+                mask = torch.ones_like(disease_idxs_tensor, dtype=torch.bool)
+                mask[disease_idxs_tensor == current_disease_idxs[i]] = False
+                negative_idxs = disease_idxs_tensor[mask]
                 negative_embs = updated_embeddings[negative_idxs]
+
                 loss, _ = model.contrastive_loss(
                     patient_emb=patient_embeddings[i],
                     mod_emb=mod_disease_embedding[i],
@@ -384,165 +456,59 @@ def train(model, train_loader, optimizer, scaler, gnn_model, graph_data, node_to
                     negative_embs=negative_embs
                 )
                 batch_loss += loss
-            scaler.scale(batch_loss/len(gender)).backward()
+
+            scaler.scale(batch_loss / len(gender)).backward()
             scaler.step(optimizer)
             scaler.update()
-            total_loss += batch_loss.item()/len(gender)
+            total_loss += batch_loss.item() / len(gender)
+
     return total_loss / len(train_loader)
 
 
-def validate(model, valid_loader, gnn_model, graph_data, node_to_idx, sentence_transformer_model, matcher, disease_idxs,
-             hit_rate, least_freq_diseases):
-    gnn_model.eval()
-    model.eval()
-    matcher.eval()
-    sentence_transformer_model.eval()
-    total_loss = 0
-    total_hit_k_metric = {f'hit@{k}': 0 for k in hit_rate}
-    total_samples = 0
-    total_auc = 0
-    total_ndcg = 0
+def compute_ndcg(logits, target_index=0):
+    """
+    logits: 1D or 2D tensor of scores (未经过 softmax 的原始分数)
+    target_index: 正样本的索引（默认 0）
+    返回 NDCG 值
+    """
+    # 保证是 1D tensor
+    if logits.dim() == 2:
+        scores = logits[0]
+    else:
+        scores = logits
 
-    least_freq_metrics = {d: {'hit': {f'hit@{k}': 0 for k in hit_rate}, 'auc': 0, 'ndcg': 0, 'count': 0} for d in least_freq_diseases}
-    category_metrics = {}
-
-    for batch in tqdm(valid_loader, desc="Validating", ncols=100, leave=True, dynamic_ncols=True):
-        with torch.no_grad():
-            with autocast():
-                gender = batch['gender']
-                batch_size = len(gender)
-                total_samples += batch_size
-                pregnancy = batch['pregnancy']
-                profile = batch['profile']
-                descriptions = batch['description']
-                disease_labels = batch['disease']  # list of strings
-                categories = batch['category']  # list of strings
-                keywords = batch['keywords']  # list of lists
-
-                patient_embeddings = model(gender, pregnancy, profile, descriptions)
-
-                num_keywords = [len(kw_list) for kw_list in keywords]
-                flattened_keywords = [kw for kw_list in keywords for kw in kw_list]
-                all_keyword_embeds = sentence_transformer_model(flattened_keywords).to(
-                    device)
-
-
-                keyword_embeds_list = []
-                start = 0
-                for n in num_keywords:
-                    keyword_embeds_list.append(all_keyword_embeds[start:start + n])
-                    start += n
-
-                mod_disease_embedding = []
-                for i in range(batch_size):
-                    dl = disease_labels[i].strip().lower()
-                    if dl not in node_to_idx:
-                        continue
-                    global_idx = node_to_idx[dl]
-                    disease_embed = graph_data.x[global_idx].unsqueeze(0).to(device)
-                    mod_subgraph_data, orig_subgraph_data, attn_scores = extract_subgraph(
-                        graph_data, node_to_idx, dl, disease_embed, keyword_embeds_list[i],
-                        hop=2, matcher=matcher)
-                    mod_output = gnn_model(mod_subgraph_data)
-                    mod_disease_embedding.append(mod_output[0])
-
-                updated_embeddings = gnn_model(graph_data)
-                current_disease_idxs = []
-                for dl in disease_labels:
-                    current_disease = dl.strip().lower()
-                    current_disease_idxs.append(node_to_idx[current_disease])
-                positive_emb = updated_embeddings[current_disease_idxs]
-
-                disease_idxs_tensor = torch.tensor(disease_idxs)
-                mask = torch.ones_like(disease_idxs_tensor, dtype=torch.bool)
-                batch_loss = 0
-                for i in range(len(current_disease_idxs)):
-                    mask[disease_idxs_tensor == current_disease_idxs[i]] = False
-                    negative_idxs = disease_idxs_tensor[mask]
-                    negative_embs = updated_embeddings[negative_idxs]
-                    loss, logits = model.contrastive_loss(
-                        patient_emb=patient_embeddings[i],
-                        mod_emb=mod_disease_embedding[i],
-                        positive_emb=positive_emb[i],
-                        negative_embs=negative_embs
-                    )
-                    ndcg = compute_ndcg(logits)
-                    total_ndcg += ndcg
-
-                    hit_k_metric, auc = metric(logits, hit_rate)
-                    total_auc += auc
-                    for k, v in hit_k_metric.items():
-                        total_hit_k_metric[f'{k}'] += v
-                    batch_loss += loss.item()
-
-                    if disease_labels[i].strip().lower() in least_freq_diseases:
-                        d = disease_labels[i].strip().lower()
-                        for k, v in hit_k_metric.items():
-                            least_freq_metrics[d]['hit'][f'{k}'] += v
-                        least_freq_metrics[d]['auc'] += auc
-                        least_freq_metrics[d]['ndcg'] += ndcg
-                        least_freq_metrics[d]['count'] += 1
-                    cat = categories[i].strip().lower()
-                    if cat not in category_metrics:
-                        category_metrics[cat] = {'hit': {f'hit@{k}': 0 for k in hit_rate}, 'auc': 0, 'ndcg': 0, 'count': 0}
-                    for k, v in hit_k_metric.items():
-                        category_metrics[cat]['hit'][f'{k}'] += v
-                    category_metrics[cat]['auc'] += auc
-                    category_metrics[cat]['ndcg'] += ndcg
-                    category_metrics[cat]['count'] += 1
-                total_loss += batch_loss / batch_size
-
-    overall_hit = {k: v / total_samples for k, v in total_hit_k_metric.items()}
-    overall_loss = total_loss / len(valid_loader)
-    overall_auc = total_auc / total_samples
-    overall_ndcg = total_ndcg / total_samples
-
-    for d in least_freq_metrics:
-        if least_freq_metrics[d]['count'] > 0:
-            for k in least_freq_metrics[d]['hit']:
-                least_freq_metrics[d]['hit'][k] /= least_freq_metrics[d]['count']
-            least_freq_metrics[d]['auc'] /= least_freq_metrics[d]['count']
-            least_freq_metrics[d]['ndcg'] /= least_freq_metrics[d]['count']
-        else:
-            least_freq_metrics[d]['hit'] = {f'{k}': 0 for k in hit_rate}
-            least_freq_metrics[d]['auc'] = 0
-            least_freq_metrics[d]['ndcg'] = 0
-
-    for cat in category_metrics:
-        if category_metrics[cat]['count'] > 0:
-            for k in category_metrics[cat]['hit']:
-                category_metrics[cat]['hit'][k] /= category_metrics[cat]['count']
-            category_metrics[cat]['auc'] /= category_metrics[cat]['count']
-            category_metrics[cat]['ndcg'] /= category_metrics[cat]['count']
-        else:
-            category_metrics[cat]['hit'] = {f'hit@{k}': 0 for k in hit_rate}
-            category_metrics[cat]['auc'] = 0
-            category_metrics[cat]['ndcg'] = 0
-
-    return overall_loss, overall_hit, overall_auc, least_freq_metrics, category_metrics, overall_ndcg
-
+    sorted_indices = torch.argsort(scores, descending=True)
+    # 查找正样本排名（1-based）
+    rank = (sorted_indices == target_index).nonzero(as_tuple=True)[0].item() + 1
+    ndcg = 1.0 / math.log2(rank + 1)
+    return ndcg
 
 
 def metric(logits, hit_rate):
+    """
+    计算多个k值的hit@k指标
+    logits: (1, num_labels)
+    """
     batch_size, num_labels = logits.shape
     hits = {}
-    auc = 0
-    # logits = logits[0]
+    # 这里 batch_size=1，但保持通用写法
     for k in hit_rate:
         current_k = min(k, num_labels)
-
         _, topk_indices = torch.topk(logits, k=current_k, dim=1)  # [batch_size, current_k]
         correct = (topk_indices == 0).any(dim=1).float()
-        hit_rate = correct.mean().item()
-
-        hits[f'hit@{k}'] = hit_rate
+        hit_value = correct.mean().item()
+        hits[f'hit@{k}'] = hit_value
 
     labels = torch.zeros(num_labels, dtype=torch.float).to(device)
     labels[0] = 1
-
-    auc = average_precision_score(labels.cpu().detach().numpy(), logits[0].cpu().detach().numpy(), average='macro')
+    auc = average_precision_score(
+        labels.cpu().detach().numpy(),
+        logits[0].cpu().detach().numpy(),
+        average='macro'
+    )
 
     return hits, auc
+
 
 def print_split_distribution_by_category(split_dataset, split_name):
     categories = [item['category'] for item in split_dataset]
@@ -550,6 +516,7 @@ def print_split_distribution_by_category(split_dataset, split_name):
     print(Fore.CYAN + f"\n{split_name} Set Category Distribution:" + Style.RESET_ALL)
     for cat, cnt in dist.items():
         print(Fore.YELLOW + f"  {cat}: {cnt}" + Style.RESET_ALL)
+
 
 class GAT(nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, heads=2):
@@ -569,8 +536,8 @@ class GAT(nn.Module):
         return self.projector(x)
 
 
-
 def print_least_freq_distribution(train_dataset, valid_dataset, test_dataset, least_n=10):
+    # 收集所有患者数据中的疾病标签
     all_labels = []
     for subset in [train_dataset, valid_dataset, test_dataset]:
         for item in subset:
@@ -604,38 +571,195 @@ def print_least_freq_distribution(train_dataset, valid_dataset, test_dataset, le
         print(Fore.YELLOW + f"{d}: {test_dist.get(d, 0)}" + Style.RESET_ALL)
 
 
-import math
+def validate(model, valid_loader, gnn_model, graph_data, node_to_idx, sentence_transformer_model, matcher,
+             disease_idxs, hit_rate, least_freq_diseases):
+    gnn_model.eval()
+    model.eval()
+    matcher.eval()
+    sentence_transformer_model.eval()
+    total_loss = 0
+    total_hit_k_metric = {f'hit@{k}': 0 for k in hit_rate}
+    total_samples = 0
+    total_auc = 0
+    total_ndcg = 0  # 累计总体 NDCG
 
-def compute_ndcg(logits, target_index=0):
+    # 初始化 least_freq_metrics 中增加 'ndcg'
+    least_freq_metrics = {
+        d: {'hit': {f'hit@{k}': 0 for k in hit_rate}, 'auc': 0, 'ndcg': 0, 'count': 0}
+        for d in least_freq_diseases
+    }
+    # 初始化 category_metrics 中增加 'ndcg'
+    category_metrics = {}  # {category: {'hit':..., 'auc':..., 'ndcg':..., 'count':...}}
 
-    sorted_indices = torch.argsort(logits, descending=True)
-    rank = (sorted_indices[0] == target_index).nonzero(as_tuple=True)[0].item() + 1
-    ndcg = 1.0 / math.log2(rank + 1)
-    return ndcg
+    for batch in tqdm(valid_loader, desc="Validating", ncols=100, leave=True, dynamic_ncols=True):
+        with torch.no_grad():
+            with autocast():
+                gender = batch['gender']
+                batch_size = len(gender)
+                total_samples += batch_size
+                pregnancy = batch['pregnancy']
+                profile = batch['profile']
+                descriptions = batch['description']
+                disease_labels = batch['disease']  # list of strings
+                categories = batch['category']     # list of strings
+                keywords = batch['keywords']       # list of lists
+
+                patient_embeddings = model(gender, pregnancy, profile, descriptions)
+
+                # 对每个样本的关键词进行编码
+                num_keywords = [len(kw_list) for kw_list in keywords]
+                flattened_keywords = [kw for kw_list in keywords for kw in kw_list]
+                all_keyword_embeds = sentence_transformer_model(flattened_keywords).to(device)
+
+                keyword_embeds_list = []
+                start = 0
+                for n in num_keywords:
+                    keyword_embeds_list.append(all_keyword_embeds[start:start + n])
+                    start += n
+
+                mod_disease_embedding = []
+                for i in range(batch_size):
+                    dl = disease_labels[i].strip().lower()
+                    if dl not in node_to_idx:
+                        continue
+                    global_idx = node_to_idx[dl]
+                    disease_embed = graph_data.x[global_idx].unsqueeze(0).to(device)
+                    mod_subgraph_data, orig_subgraph_data, attn_scores = extract_subgraph(
+                        graph_data, node_to_idx, dl, disease_embed, keyword_embeds_list[i],
+                        hop=2, matcher=matcher
+                    )
+                    mod_output = gnn_model(mod_subgraph_data)
+                    mod_disease_embedding.append(mod_output[0])
+
+                updated_embeddings = gnn_model(graph_data)
+                current_disease_idxs = []
+                for dl in disease_labels:
+                    current_disease = dl.strip().lower()
+                    current_disease_idxs.append(node_to_idx[current_disease])
+
+                positive_emb = updated_embeddings[current_disease_idxs]
+
+                disease_idxs_tensor = torch.tensor(disease_idxs, device=device)
+                batch_loss = 0.0
+
+                for i in range(len(current_disease_idxs)):
+                    # 每个样本单独重置 mask（修复 BUG）
+                    mask = torch.ones_like(disease_idxs_tensor, dtype=torch.bool)
+                    mask[disease_idxs_tensor == current_disease_idxs[i]] = False
+                    negative_idxs = disease_idxs_tensor[mask]
+                    negative_embs = updated_embeddings[negative_idxs]
+
+                    loss, logits = model.contrastive_loss(
+                        patient_emb=patient_embeddings[i],
+                        mod_emb=mod_disease_embedding[i],
+                        positive_emb=positive_emb[i],
+                        negative_embs=negative_embs
+                    )
+
+                    # logits: (1, num_labels)
+                    ndcg = compute_ndcg(logits)
+                    total_ndcg += ndcg
+
+                    hit_k_metric, auc = metric(logits, hit_rate)
+                    total_auc += auc
+                    for k, v in hit_k_metric.items():
+                        total_hit_k_metric[f'{k}'] += v
+                    batch_loss += loss.item()
+
+                    # 针对最罕见疾病
+                    dl_norm = disease_labels[i].strip().lower()
+                    if dl_norm in least_freq_diseases:
+                        d = dl_norm
+                        for k, v in hit_k_metric.items():
+                            least_freq_metrics[d]['hit'][f'{k}'] += v
+                        least_freq_metrics[d]['auc'] += auc
+                        least_freq_metrics[d]['ndcg'] += ndcg
+                        least_freq_metrics[d]['count'] += 1
+                    # 按 category 统计
+                    cat = categories[i].strip().lower()
+                    if cat not in category_metrics:
+                        category_metrics[cat] = {
+                            'hit': {f'hit@{k}': 0 for k in hit_rate},
+                            'auc': 0,
+                            'ndcg': 0,
+                            'count': 0
+                        }
+                    for k, v in hit_k_metric.items():
+                        category_metrics[cat]['hit'][f'{k}'] += v
+                    category_metrics[cat]['auc'] += auc
+                    category_metrics[cat]['ndcg'] += ndcg
+                    category_metrics[cat]['count'] += 1
+
+                total_loss += batch_loss / batch_size
+
+    overall_hit = {k: v / total_samples for k, v in total_hit_k_metric.items()}
+    overall_loss = total_loss / len(valid_loader)
+    overall_auc = total_auc / total_samples
+    overall_ndcg = total_ndcg / total_samples
+
+    for d in least_freq_metrics:
+        if least_freq_metrics[d]['count'] > 0:
+            for k in least_freq_metrics[d]['hit']:
+                least_freq_metrics[d]['hit'][k] /= least_freq_metrics[d]['count']
+            least_freq_metrics[d]['auc'] /= least_freq_metrics[d]['count']
+            least_freq_metrics[d]['ndcg'] /= least_freq_metrics[d]['count']
+        else:
+            least_freq_metrics[d]['hit'] = {f'hit@{k}': 0 for k in hit_rate}
+            least_freq_metrics[d]['auc'] = 0
+            least_freq_metrics[d]['ndcg'] = 0
+
+    for cat in category_metrics:
+        if category_metrics[cat]['count'] > 0:
+            for k in category_metrics[cat]['hit']:
+                category_metrics[cat]['hit'][k] /= category_metrics[cat]['count']
+            category_metrics[cat]['auc'] /= category_metrics[cat]['count']
+            category_metrics[cat]['ndcg'] /= category_metrics[cat]['count']
+        else:
+            category_metrics[cat]['hit'] = {f'hit@{k}': 0 for k in hit_rate}
+            category_metrics[cat]['auc'] = 0
+            category_metrics[cat]['ndcg'] = 0
+
+    return overall_loss, overall_hit, overall_auc, least_freq_metrics, category_metrics, overall_ndcg
 
 
 def main(args):
-    patient_csv = "output/merged_output_tdf.csv"
+    # 加载数据
+    patient_csv = "output/merged_output_tdf.csv"  # 患者相关信息和关键词
 
     patient_data = pd.read_csv(patient_csv).fillna("")
+    # 统计患者中疾病分布
     print(Fore.GREEN + f"Total number of patients: {len(patient_data)}" + Style.RESET_ALL)
+
+    category_disease_counts = (
+        patient_data
+        .assign(category=patient_data['category'].str.strip().str.lower(),
+                disease=patient_data['disease'].str.strip().str.lower())
+        .groupby('category')['disease']
+        .nunique()
+    )
+    print(Fore.CYAN + "\nDistinct diseases per category:" + Style.RESET_ALL)
+    for cat, cnt in category_disease_counts.items():
+        print(Fore.YELLOW + f"  {cat}: {cnt}" + Style.RESET_ALL)
+
     disease_counts = patient_data['disease'].str.strip().str.lower().value_counts()
     print(Fore.CYAN + "\nTop 10 least frequent diseases in patients:" + Style.RESET_ALL)
     least_10 = disease_counts.sort_values().head(10)
     for disease, count in least_10.items():
         print(Fore.YELLOW + f"{disease}: {count}" + Style.RESET_ALL)
 
-
     print(Fore.CYAN + "======== Loading Data ========" + Style.RESET_ALL)
     data = pd.read_csv("output/merged_output_tdf.csv").fillna("")
-    fused_kg_file = "fused_kg_with_embeddings.json"
+    fused_kg_file = "fused_kg_with_embeddings.json"  # 包含融合后的 KG 和嵌入（预构建）
+
     print(Fore.CYAN + "Loading KG..." + Style.RESET_ALL)
     with open(fused_kg_file, 'r', encoding='utf-8') as f:
         fused_kg_triplets = json.load(f)
     print(Fore.GREEN + "KG loaded." + Style.RESET_ALL)
+
     print(Fore.CYAN + "Constructing Global Graph..." + Style.RESET_ALL)
     graph_data, node_to_idx = build_graph_from_kg(fused_kg_triplets)
     print(Fore.GREEN + "Global graph constructed." + Style.RESET_ALL)
+
     print(Fore.CYAN + "Initializing SentenceTransformer for Patient Keywords..." + Style.RESET_ALL)
 
     disease_map = {d: i for i, d in enumerate(sorted(data['disease'].unique()))}
@@ -646,36 +770,45 @@ def main(args):
     valid_size = int(0.1 * len(dataset))
     test_size = len(dataset) - train_size - valid_size
     train_dataset, valid_dataset, test_dataset = random_split(dataset, [train_size, valid_size, test_size])
-    print(
-        Fore.GREEN + f"Dataset split into Train: {train_size}, Valid: {valid_size}, Test: {test_size}" + Style.RESET_ALL)
+    print(Fore.GREEN + f"Dataset split into Train: {train_size}, Valid: {valid_size}, Test: {test_size}" + Style.RESET_ALL)
 
     sub_train_ratio = args.train_ratio
     sub_train_size = int(sub_train_ratio * len(train_dataset))
-    masked_train_size = len(train_dataset) - int(sub_train_ratio * len(train_dataset))
+    masked_train_size = len(train_dataset) - sub_train_size
     sub_train_dataset, masked_dataset = random_split(train_dataset, [sub_train_size, masked_train_size])
 
     print_least_freq_distribution(train_dataset, valid_dataset, test_dataset, least_n=10)
+
     batch_size = args.batch_size
     train_loader = DataLoader(sub_train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
     valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-
 
     in_channels = graph_data.x.size(1)
     hidden_channels = 64
     out_channels = 32
     gnn_model = GAT(in_channels, hidden_channels, out_channels, heads=2).to(device)
     matcher = CrossAttentionMatcher(embed_dim=in_channels, num_heads=4).to(device)
-    sentence_transformer_model = SentenceTransformer(device='cuda' if torch.cuda.is_available() else 'cpu').to(device)
+    sentence_transformer_model = SentenceTransformer(
+        device='cuda' if torch.cuda.is_available() else 'cpu'
+    ).to(device)
     model = PatientEmbedding(
         dropout=0.1,
         device=device,
         alpha=args.alpha
     ).to(device)
-    all_parameters = list(model.parameters()) + list(gnn_model.parameters()) + list(matcher.parameters()) + list(sentence_transformer_model.parameters())
+
+    all_parameters = (
+        list(model.parameters())
+        + list(gnn_model.parameters())
+        + list(matcher.parameters())
+        + list(sentence_transformer_model.parameters())
+    )
+
     print_split_distribution_by_category(train_dataset, "Train")
     print_split_distribution_by_category(valid_dataset, "Valid")
     print_split_distribution_by_category(test_dataset, "Test")
+
     optimizer = torch.optim.AdamW(
         params=all_parameters,
         lr=0.0001,
@@ -685,13 +818,18 @@ def main(args):
     scheduler = lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.8)
     scaler = GradScaler()
     hit_rate = [1, 3, 10]
+
     disease_folder = "disease introduction/filtered"
-    disease_names = [os.path.splitext(f)[0].lower()
-                     for f in os.listdir(disease_folder) if f.endswith(".txt")]
+    disease_names = [
+        os.path.splitext(f)[0].lower()
+        for f in os.listdir(disease_folder)
+        if f.endswith(".txt")
+    ]
     disease_idxs = []
     for disease in disease_names:
         if disease in node_to_idx:
             disease_idxs.append(node_to_idx[disease])
+
     graph_data = graph_data.to(device)
 
     model_folder = f"saved_models/{sub_train_ratio}/alpha_{args.alpha}"
@@ -699,23 +837,32 @@ def main(args):
         os.makedirs(model_folder)
     best_valid_loss = float('inf')
 
+    # Define log file path
     log_file = os.path.join(model_folder, "training_log.csv")
     least_freq_diseases = sorted(disease_counts.sort_values().head(10).index.tolist())
 
+    # 初始化 CSV 日志（增加 NDCG 列）
     with open(log_file, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         example_hit_dis = {f'hit@{k}': 0 for k in hit_rate}
         hit_dis_keys = list(example_hit_dis.keys())
         headers = ["epoch", "train_loss", "valid_loss", "AUC", "NDCG"] + [f"hit_{key}" for key in hit_dis_keys] + [
-            "cat_metrics"]
+            "cat_metrics"
+        ]
         writer.writerow(headers)
+
     num_epochs = args.num_epochs
     for epoch in range(num_epochs):
-        train_loss = train(model, train_loader, optimizer, scaler, gnn_model, graph_data, node_to_idx,
-                           sentence_transformer_model, matcher, disease_idxs)
+        train_loss = train(
+            model, train_loader, optimizer, scaler,
+            gnn_model, graph_data, node_to_idx,
+            sentence_transformer_model, matcher, disease_idxs
+        )
         valid_loss, hit_dis, disease_auc, least_freq_metrics, category_metrics, overall_ndcg = validate(
-            model, valid_loader, gnn_model, graph_data, node_to_idx, sentence_transformer_model, matcher, disease_idxs,
-            hit_rate, least_freq_diseases)
+            model, valid_loader, gnn_model, graph_data, node_to_idx,
+            sentence_transformer_model, matcher, disease_idxs,
+            hit_rate, least_freq_diseases
+        )
         print(Fore.MAGENTA + f"\nEpoch {epoch + 1}/{num_epochs} Summary:" + Style.RESET_ALL)
         print(Fore.YELLOW + f"  Train Loss: {train_loss:.4f}" + Style.RESET_ALL)
         print(Fore.YELLOW + f"  Valid Loss: {valid_loss:.4f}" + Style.RESET_ALL)
@@ -724,9 +871,11 @@ def main(args):
         print(Fore.CYAN + f"  Category Metrics:" + Style.RESET_ALL)
         for cat, metrics in category_metrics.items():
             print(
-                Fore.YELLOW + f"    {cat}: hit: {metrics['hit']}, AUC: {metrics['auc']}, NDCG: {metrics['ndcg']}" + Style.RESET_ALL)
+                Fore.YELLOW
+                + f"    {cat}: hit: {metrics['hit']}, AUC: {metrics['auc']}, NDCG: {metrics['ndcg']}"
+                + Style.RESET_ALL
+            )
         scheduler.step()
-
 
         if valid_loss < best_valid_loss:
             best_valid_loss = valid_loss
@@ -740,10 +889,12 @@ def main(args):
             }
             torch.save(best_state, os.path.join(model_folder, "best_model.pt"))
             print(Fore.GREEN + f"  [Best model updated at epoch {epoch + 1}]" + Style.RESET_ALL)
+
         with open(log_file, mode='a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            row = [epoch + 1, train_loss, valid_loss, disease_auc, overall_ndcg] + [hit_dis.get(key, 0) for key in
-                                                                                    hit_dis_keys] + [category_metrics]
+            row = [epoch + 1, train_loss, valid_loss, disease_auc, overall_ndcg] + [
+                hit_dis.get(key, 0) for key in hit_dis_keys
+            ] + [category_metrics]
             writer.writerow(row)
 
     best_state = torch.load(os.path.join(model_folder, "best_model.pt"), map_location=device)
@@ -753,8 +904,10 @@ def main(args):
     sentence_transformer_model.load_state_dict(best_state['keyword_embed'])
 
     test_loss, test_hit_dis, test_disease_auc, _, test_category_metrics, test_overall_ndcg = validate(
-        model, test_loader, gnn_model, graph_data, node_to_idx, sentence_transformer_model, matcher, disease_idxs,
-        hit_rate, least_freq_diseases)
+        model, test_loader, gnn_model, graph_data, node_to_idx,
+        sentence_transformer_model, matcher, disease_idxs,
+        hit_rate, least_freq_diseases
+    )
     print(Fore.MAGENTA + "\nTest Results:" + Style.RESET_ALL)
     print(Fore.YELLOW + f"  Test Loss: {test_loss:.4f}" + Style.RESET_ALL)
     print(Fore.YELLOW + f"  Overall AUC: {test_disease_auc:.4f}, NDCG: {test_overall_ndcg:.4f}" + Style.RESET_ALL)
@@ -762,19 +915,25 @@ def main(args):
     print(Fore.CYAN + "  Test Category Metrics:" + Style.RESET_ALL)
     for cat, metrics in test_category_metrics.items():
         print(
-            Fore.YELLOW + f"    {cat}: hit: {metrics['hit']}, AUC: {metrics['auc']}, NDCG: {metrics['ndcg']}" + Style.RESET_ALL)
+            Fore.YELLOW
+            + f"    {cat}: hit: {metrics['hit']}, AUC: {metrics['auc']}, NDCG: {metrics['ndcg']}"
+            + Style.RESET_ALL
+        )
     with open(log_file, mode='a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        test_row = ["TEST", test_loss, "-", test_disease_auc, test_overall_ndcg] + [test_hit_dis.get(key, 0) for key in
-                                                                                    hit_dis_keys] + [
-                       test_category_metrics]
+        hit_dis_keys = [f'hit@{k}' for k in [1, 3, 10]]
+        test_row = ["TEST", test_loss, "-", test_disease_auc, test_overall_ndcg] + [
+            test_hit_dis.get(key, 0) for key in hit_dis_keys
+        ] + [test_category_metrics]
         writer.writerow(test_row)
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train disease prediction model")
-    parser.add_argument("--train_ratio", type=float, default=1.0, help="train mask ratio")
-    parser.add_argument("--num_epochs", type=int, default=120, help="train epoch")
-    parser.add_argument("--batch_size", type=int, default=16, help="train batch size")
-    parser.add_argument("--alpha", type=float, default=0.5, help="adjust semantic loss ratio")
+    parser = argparse.ArgumentParser(description="训练疾病预测模型")
+    parser.add_argument("--train_ratio", type=float, default=1.0, help="训练集所占比例")
+    parser.add_argument("--num_epochs", type=int, default=500, help="训练轮数")
+    parser.add_argument("--batch_size", type=int, default=32, help="训练batch大小")
+    parser.add_argument("--alpha", type=float, default=0.5, help="adjust loss")
+    parser.add_argument("--lung_ratio", type=float, default=1.0, help="adjust ratio of lung category")
     args = parser.parse_args()
     main(args)
